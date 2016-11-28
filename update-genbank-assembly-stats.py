@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boole
 from sqlalchemy.orm import relationship, sessionmaker
 from bs4 import BeautifulSoup
 import inflect
+from sonLib.bioio import popenCatch
 
 from operator import itemgetter
 import requests
@@ -29,6 +30,7 @@ class Assembly(Base):
     contig_n50 = Column(Integer)
     size = Column(Integer)
     num_ns = Column(Integer)
+    num_masked = Column(Integer)
     ftp_url = Column(String)
     this_assembly_is_terrible = Column(Boolean)
 
@@ -56,6 +58,8 @@ def get_position_in_rank(session, assembly, stat, rank, name):
     return ranked_list.index(my_stat)
 
 def get_assemblies_in_rank(session, rank, name):
+    if name is None:
+        return []
     # Construct a filter-function for the rank and name.
     filters = {'species': lambda x: x.name == name,
                'genus': lambda x: x.genus == name,
@@ -85,7 +89,6 @@ def get_minimal_rank(session, species, at_least=1):
         if species.__dict__[attr] == None:
             continue
         n = len(get_assemblies_in_rank(session, i, species.__dict__[attr]))
-        print n, i, species.__dict__[attr], at_least
         if at_least == 1 and nth == 1:
             # HACK: so the "first" is always the maximal rank, which
             # is typically the most interesting data point
@@ -118,25 +121,31 @@ def post_to_slack(hook_url, assembly, session):
     nth, rank, name = get_minimal_rank(session, species)
     text += "This is the {nth} assembly for the {rank} _{name}_.\n".format(nth=inflect_eng.ordinal(inflect_eng.number_to_words(nth)), rank=rank, name=name)
 
+    text += "_{species}_ ({num_sp}) < _{genus}_ ({num_gn}) < _{family}_ ({num_fam}) < _{order}_ ({num_ord}) < _{class_}_ ({num_cl})\n".format(species=species.name, num_sp=len(get_assemblies_in_rank(session, "species", species.name)),
+    genus=species.genus, num_gn=len(get_assemblies_in_rank(session, "genus", species.genus)),
+    family=species.family, num_fam=len(get_assemblies_in_rank(session, "family", species.family)),
+    order=species.order, num_ord=len(get_assemblies_in_rank(session, "order", species.order)),
+    class_=species.class_, num_cl=len(get_assemblies_in_rank(session, "class", species.class_)))
+
     _, rank_to_compare, name_to_compare = get_minimal_rank(session, species, at_least=MIN_SPECIES_TO_COMPARE)
 
     num_assemblies_compared = len(get_assemblies_in_rank(session, rank_to_compare, name_to_compare))
 
-    text += "*Scaffold N50*: {n50}".format(n50=assembly.scaffold_n50)
+    text += "*Scaffold N50*: {n50:,}".format(n50=assembly.scaffold_n50)
     if num_assemblies_compared >= MIN_SPECIES_TO_COMPARE:
         text += " ({pct} percentile within {rank} _{name}_)".format(
             pct=inflect_eng.ordinal(percentile(session, assembly, "scaffold_n50", rank_to_compare, name_to_compare)),
             rank=rank_to_compare,
             name=name_to_compare)
     text += "\n"
-    text += "*Contig N50*: {n50}".format(n50=assembly.contig_n50)
+    text += "*Contig N50*: {n50:,}".format(n50=assembly.contig_n50)
     if num_assemblies_compared >= MIN_SPECIES_TO_COMPARE:
         text += " ({pct} percentile within {rank} _{name}_)".format(
             pct=inflect_eng.ordinal(percentile(session, assembly, "contig_n50", rank_to_compare, name_to_compare)),
             rank=rank_to_compare,
             name=name_to_compare)
     text += "\n"
-    text += "*Size*: {size}".format(size=assembly.size)
+    text += "*Size*: {size:,}".format(size=assembly.size)
     if num_assemblies_compared >= MIN_SPECIES_TO_COMPARE:
         text += " ({pct}% of median size within {rank} _{name}_)".format(
             pct=assembly.size*100/median(session, assembly, "size", rank_to_compare, name_to_compare),
@@ -144,15 +153,24 @@ def post_to_slack(hook_url, assembly, session):
             name=name_to_compare)
     text += "\n"
     text += "*%N*: {n_pct:.2f}%\n".format(n_pct=float(assembly.num_ns)/assembly.size*100)
+    text += "*%masked*: {pct:.2f}%\n".format(pct=float(assembly.num_masked)/assembly.size*100)
     if assembly.ftp_url != '':
         text += "<{fastagz}|gzipped FASTA> | <{ftp}|GenBank FTP>".format(ftp=assembly.ftp_url, fastagz=get_fasta_gz_url(assembly.ftp_url))
     message = {'text': text}
     print text
-    #requests.post(hook_url, json=message)
+    requests.post(hook_url, json=message)
+
+def get_masked_bases(ftp_url):
+    if ftp_url == '':
+        return 0
+    paths = ftp_url.split('/')
+    rm_out_url = ftp_url + '/' + paths[-1] + '_rm.out.gz'
+    output = popenCatch("curl -s %s | gzip -d | sed '1,3d' | awk '{total += $7 - $6} END { print total }'" % rm_out_url)
+    return int(output)
 
 def parse_meta(meta):
     """Parse out the N50, etc. from the XML in the "Meta" tag."""
-    soup = BeautifulSoup(meta, 'lxml')
+    soup = BeautifulSoup(meta, 'html5lib')
     return dict([(s['category'], int(s.text)) for s in soup.find_all('stat') if s['sequence_tag'] == 'all'])
 
 def parse_args():
@@ -177,7 +195,7 @@ def main():
     assert int(search_results['Count']) < 10000
 
     search_results['IdList'].reverse()
-    ids = map(int, search_results['IdList'][:-5])
+    ids = map(int, search_results['IdList'])
     session = Session()
     ids_to_remove = map(itemgetter(0), session.query(Assembly.id).filter(Assembly.id.in_(ids)).all())
     session.close()
@@ -197,7 +215,8 @@ def main():
                             scaffold_n50 = stats['scaffold_n50'],
                             contig_n50 = stats['contig_n50'],
                             size = stats['total_length'],
-                            num_ns = stats['total_length'] - stats['ungapped_length'])
+                            num_ns = stats['total_length'] - stats['ungapped_length'],
+                            num_masked = get_masked_bases(summary['FtpPath_GenBank']))
         session = Session()
         if session.query(Species.id).filter(Species.id==assembly.species_id).scalar() is None:
             handle = Entrez.efetch(db='taxonomy', id=assembly.species_id, rettype='full', retmode='xml')
