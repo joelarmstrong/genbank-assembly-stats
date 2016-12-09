@@ -178,6 +178,8 @@ def parse_args():
     parser.add_argument('db', help='Path to database')
     parser.add_argument('--slack-hook',
                         help='URL of slack webhook to post new releases to')
+    parser.add_argument('--limit', type=int,
+                        help='Only process this many new assemblies')
     return parser.parse_args()
 
 def main():
@@ -200,6 +202,10 @@ def main():
     ids_to_remove = map(itemgetter(0), session.query(Assembly.id).filter(Assembly.id.in_(ids)).all())
     session.close()
     ids = set(ids) - set(ids_to_remove)
+
+    if opts.limit is not None:
+        # Only do the first N new assemblies.
+        ids = list(ids)[:opts.limit]
 
     for id in ids:
         handle = Entrez.efetch(db='assembly', id=id, rettype='docsum')
