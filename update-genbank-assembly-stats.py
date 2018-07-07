@@ -212,9 +212,14 @@ def main():
         record = Entrez.read(handle, validate=False)
         summary = record['DocumentSummarySet']['DocumentSummary'][0]
         stats = parse_meta(summary['Meta'])
+        awful_assembly = False
+        if int(summary['SpeciesTaxid']) == 9606 and int(stats['total_length']) < 1000000000:
+            # Garbage human assembly. There are tons of shitty partial
+            # assemblies mislabeled as "genome representation: full".
+            awful_assembly = True
         assembly = Assembly(id=id,
                             species_id=int(summary['SpeciesTaxid']),
-                            this_assembly_is_terrible=False,
+                            this_assembly_is_terrible=awful_assembly,
                             ftp_url=summary['FtpPath_GenBank'],
                             name = summary['AssemblyName'],
                             accession = summary['AssemblyAccession'],
@@ -239,7 +244,7 @@ def main():
             session.add(species)
         session.add(assembly)
         session.commit()
-        if opts.slack_hook is not None:
+        if opts.slack_hook is not None and not awful_assembly:
             post_to_slack(opts.slack_hook, assembly, session)
         time.sleep(1)
 
