@@ -12,6 +12,9 @@ import inflect
 from sonLib.bioio import popenCatch
 
 from operator import itemgetter
+import logging
+logging.basicConfig()
+logger = logging.getLogger(__name__)
 import requests
 import os
 import time
@@ -112,7 +115,7 @@ def median(session, assembly, stat, rank, name):
     ranked_list = sorted(stat_list, reverse=True)
     return ranked_list[len(ranked_list)/2]
 
-def post_to_slack(hook_url, assembly, session):
+def post_to_slack(hook_url, assembly, wgs_metadata, session):
     MIN_SPECIES_TO_COMPARE = 4
 
     species = assembly.species
@@ -154,6 +157,10 @@ def post_to_slack(hook_url, assembly, session):
     text += "\n"
     text += "*%N*: {n_pct:.2f}%\n".format(n_pct=float(assembly.num_ns)/assembly.size*100)
     text += "*%masked*: {pct:.2f}%\n".format(pct=float(assembly.num_masked)/assembly.size*100)
+    for key, value in wgs_metadata.items():
+        if key not in ('Assembly Name', 'Assembly Date'):
+            text += "*{key}*: {value}\n".format(key=key, value=value)
+
     if assembly.ftp_url != '':
         text += "<{fastagz}|gzipped FASTA> | <{ftp}|GenBank FTP>".format(ftp=assembly.ftp_url, fastagz=get_fasta_gz_url(assembly.ftp_url))
     message = {'text': text}
@@ -172,6 +179,50 @@ def parse_meta(meta):
     """Parse out the N50, etc. from the XML in the "Meta" tag."""
     soup = BeautifulSoup(meta, 'html5lib')
     return dict([(s['category'], int(s.text)) for s in soup.find_all('stat') if s['sequence_tag'] == 'all'])
+
+def get_wgs_record(wgs_name):
+    try:
+        # Get the actual accession from the weird WGS name genbank gives
+        # us (which looks like QEHV01 instead of QEHV00000000.1).
+        wgs_accession = wgs_name.replace('0', '00000000.')
+        handle = Entrez.esearch(db='nuccore', term='%s' % wgs_accession)
+        search_results = Entrez.read(handle)
+        ids = map(int, search_results['IdList'])
+        if len(ids) != 1:
+            # Something's up; this accession is reused or missing. Bail out.
+            logger.warning('got %d records for WGS record, skipping', len(ids))
+            return '', {}
+        handle = Entrez.efetch(db='nuccore', id=ids[0], rettype='gb', retmode='text')
+        text = handle.read()
+        # Parse comment to extract Genome-Assembly-Data records.
+        start = text.index('##Genome-Assembly-Data-START##')
+        end = text.index('##Genome-Assembly-Data-END##')
+        lines = text[start:end].split("\n")
+        # skip header line
+        lines = lines[1:]
+        # parse out key :: value pairs. the values can span
+        # lines, so this is somewhat complicated.
+        data = {}
+        key = None
+        value = None
+        for line in lines:
+            if "::" in line:
+                if key is not None:
+                    assert value is not None
+                    data[key] = value
+                key, value = line.split("::")
+                # plenty o' whitespace
+                key = key.strip()
+                value = value.strip()
+            else:
+                value += line.strip()
+        if key is not None:
+            data[key] = value
+        return text, data
+    except:
+        logger.exception("Can't parse/fetch master WGS record.")
+        # Something happened when trying to parse this garbage; just bail out.
+        return '', {}
 
 def parse_args():
     parser = ArgumentParser()
@@ -211,6 +262,8 @@ def main():
         handle = Entrez.efetch(db='assembly', id=id, rettype='docsum')
         record = Entrez.read(handle, validate=False)
         summary = record['DocumentSummarySet']['DocumentSummary'][0]
+        wgs_name = summary['WGS']
+        wgs_comment, wgs_metadata = get_wgs_record(wgs_name)
         stats = parse_meta(summary['Meta'])
         awful_assembly = False
         if int(summary['SpeciesTaxid']) == 9606 and int(stats['total_length']) < 1000000000:
@@ -245,7 +298,7 @@ def main():
         session.add(assembly)
         session.commit()
         if opts.slack_hook is not None and not awful_assembly:
-            post_to_slack(opts.slack_hook, assembly, session)
+            post_to_slack(opts.slack_hook, assembly, wgs_metadata, session)
         time.sleep(1)
 
 if __name__ == '__main__':
